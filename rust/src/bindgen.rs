@@ -181,9 +181,15 @@ impl WasmtimePy {
                 }
                 Trampoline::Transcoder { .. } => unimplemented!(),
                 Trampoline::AlwaysTrap => unimplemented!(),
-                Trampoline::ResourceNew(_) => unimplemented!(),
+                Trampoline::ResourceNew(idx) => {
+                    // TODO: Need to figure out how trampoline gets generated here.
+                    let _rid = idx.as_u32();
+                }
                 Trampoline::ResourceRep(_) => unimplemented!(),
-                Trampoline::ResourceDrop(_) => unimplemented!(),
+                Trampoline::ResourceDrop(idx) => {
+                    // TODO: Need to figure out where trampoline gets generated here.
+                    let _rid = idx.as_u32();
+                }
                 Trampoline::ResourceEnterCall => unimplemented!(),
                 Trampoline::ResourceExitCall => unimplemented!(),
                 Trampoline::ResourceTransferOwn => unimplemented!(),
@@ -531,7 +537,11 @@ impl<'a> Instantiator<'a> {
 
             GlobalInitializer::LowerImport { index, import } => self.lower_import(*index, *import),
 
-            GlobalInitializer::Resource(_) => unimplemented!(),
+            GlobalInitializer::Resource(r) => {
+                // TODO: I believe this is where we'd codegen the various pieces that would go into
+                // Root.__init__
+                uwriteln!(self.gen.init, "# TODO: Add resource pieces here");
+            }
         }
     }
 
@@ -591,8 +601,8 @@ impl<'a> Instantiator<'a> {
                     Some(pos) => import_name.split_at(pos + 1).1,
                     None => &import_name,
                 }
-                .to_snake_case()
-                .escape();
+                    .to_snake_case()
+                    .escape();
                 (
                     &self.resolve.interfaces[*i].functions[&path[0]],
                     Some(*i),
@@ -747,8 +757,8 @@ impl<'a> Instantiator<'a> {
     }
 
     fn core_export<T>(&self, export: &CoreExport<T>) -> String
-    where
-        T: Into<EntityIndex> + Copy,
+        where
+            T: Into<EntityIndex> + Copy,
     {
         let name = match &export.item {
             ExportItem::Index(idx) => {
@@ -894,6 +904,10 @@ impl<'a> Instantiator<'a> {
             mem::swap(&mut self.gen.init, src);
         }
 
+        // TODO: jmes, you are here.  You need to partition out the lifts associated
+        // with a resource vs. functions directly on the interface.  The code is
+        // *mostly* the same, except, we want to generate this code in a separate
+        // class entirely.
         for lift in lifts {
             // Go through some small gymnastics to print the function signature
             // here.
@@ -968,6 +982,26 @@ impl InterfaceGenerator<'_> {
             Type::String => self.src.push_str("str"),
             Type::Id(id) => {
                 let ty = &self.resolve.types[*id];
+                // TODO: We won't hit this case because there is no name here.
+                // For a resource type, we actually get a handle to a resource, and the handle
+                // has no type:
+                //
+                //     {
+                //       "name": "demo-resource-class",
+                //       "kind": "resource",
+                //       "owner": {
+                //         "interface": 0
+                //       }
+                //     },
+                //     {
+                //       "name": null,
+                //       "kind": {
+                //         "handle": {
+                //           "borrow": 1
+                //         }
+                //       },
+                //       "owner": null
+                //     },
                 if let Some(name) = &ty.name {
                     let owner = match ty.owner {
                         TypeOwner::Interface(id) => id,
@@ -1046,7 +1080,14 @@ impl InterfaceGenerator<'_> {
                         self.print_optional_ty(s.end.as_ref(), true);
                         self.src.push_str("]");
                     }
-                    TypeDefKind::Resource | TypeDefKind::Handle(_) => unimplemented!(),
+                    TypeDefKind::Resource => unimplemented!(),
+                    TypeDefKind::Handle(Handle::Own(t) | Handle::Borrow(t)) => {
+                        // TODO: check, but I don't think there's a python type for handles.
+                        let ty = &self.resolve.types[*t];
+                        if let Some(name) = &ty.name {
+                            self.src.push_str(&name.to_upper_camel_case().escape());
+                        }
+                    }
                     TypeDefKind::Unknown => unreachable!(),
                 }
             }
@@ -1089,7 +1130,12 @@ impl InterfaceGenerator<'_> {
 
     fn print_sig(&mut self, func: &Function, in_import: bool) -> Vec<String> {
         self.src.push_str("def ");
-        self.src.push_str(&func.name.to_snake_case().escape());
+        let func_name = func.item_name().to_snake_case().escape();
+        let py_name = match func.kind {
+            FunctionKind::Constructor(_) => "__init__",
+            _ => &func_name
+        };
+        self.src.push_str(py_name);
         if in_import {
             self.src.push_str("(self");
         } else {
@@ -1097,7 +1143,18 @@ impl InterfaceGenerator<'_> {
             self.src.push_str("(self, caller: wasmtime.Store");
         }
         let mut params = Vec::new();
-        for (param, ty) in func.params.iter() {
+        let func_params = match func.kind {
+            FunctionKind::Method(_) => {
+                // Methods are generated as a separate class so the `self` param
+                // is already part of the signature.
+                // We still want to this to `params` which is used to create a FunctionBindgen.
+                let first_param = &func.params[0].0;
+                params.push(first_param.to_snake_case().escape());
+                &func.params[1..]
+            },
+            _ => &func.params
+        };
+        for (param, ty) in func_params.iter() {
             self.src.push_str(", ");
             self.src.push_str(&param.to_snake_case().escape());
             params.push(param.to_snake_case().escape());
@@ -1107,7 +1164,10 @@ impl InterfaceGenerator<'_> {
         self.src.push_str(") -> ");
         match func.results.len() {
             0 => self.src.push_str("None"),
-            1 => self.print_ty(func.results.iter_types().next().unwrap(), true),
+            1 => match func.kind {
+                FunctionKind::Constructor(_) => self.src.push_str("None"),
+                _ => self.print_ty(func.results.iter_types().next().unwrap(), true),
+            },
             _ => {
                 self.src.pyimport("typing", "Tuple");
                 self.src.push_str("Tuple[");
@@ -1139,10 +1199,53 @@ impl InterfaceGenerator<'_> {
                 TypeDefKind::Type(t) => self.type_alias(id, name, t, &ty.docs),
                 TypeDefKind::Future(_) => todo!("generate for future"),
                 TypeDefKind::Stream(_) => todo!("generate for stream"),
-                TypeDefKind::Resource | TypeDefKind::Handle(_) => unimplemented!(),
+                TypeDefKind::Resource => {
+                    self.type_resource(id, name, interface)
+                    // This is where we actually define the resource type.  We'd likely generate
+                    // a class MyClass(Protocol): ...
+                    // here.
+                    // This is generated BEFORE the interface type class.
+                    //self.src.push_str("\n===HELLO FROM TypeDefKind::Resource\n===\n");
+                }
+                TypeDefKind::Handle(_) => unimplemented!(),
                 TypeDefKind::Unknown => unreachable!(),
             }
         }
+    }
+
+    fn type_resource(&mut self, id: TypeId, name: &str, interface: InterfaceId) {
+        //
+        self.src.pyimport("typing", "Protocol");
+        let cls_name = name.to_upper_camel_case().escape();
+        let methods = self.resolve.interfaces[interface].functions
+            .iter()
+            .filter_map(|(_, func)| {
+                match func.kind {
+                    FunctionKind::Method(t)
+                    | FunctionKind::Static(t)
+                    | FunctionKind::Constructor(t) => {
+                        if t == id {
+                            Some(func)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None
+                }
+            })
+            .collect::<Vec<_>>();
+        self.src.push_str(&format!("class {}(Protocol):\n", cls_name));
+        self.src.indent();
+        for method in &methods {
+            self.print_sig(method, false);
+            self.src.push_str(": ...\n");
+        }
+        if methods.is_empty() {
+            self.src.push_str("pass\n\n");
+        } else {
+            self.src.push_str("\n\n");
+        }
+        self.src.dedent();
     }
 
     fn type_record(&mut self, _id: TypeId, name: &str, record: &Record, docs: &Docs) {
@@ -1366,8 +1469,8 @@ struct FunctionBindgen<'a, 'b> {
 
 impl FunctionBindgen<'_, '_> {
     fn clamp<T>(&mut self, results: &mut Vec<String>, operands: &[String], min: T, max: T)
-    where
-        T: std::fmt::Display,
+        where
+            T: std::fmt::Display,
     {
         let clamp = self.print_clamp();
         results.push(format!("{clamp}({}, {min}, {max})", operands[0]));
@@ -1976,7 +2079,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 }
 
                 for (i, ((case, (block, block_results)), payload)) in
-                    variant.cases.iter().zip(blocks).zip(payloads).enumerate()
+                variant.cases.iter().zip(blocks).zip(payloads).enumerate()
                 {
                     if i == 0 {
                         self.gen.src.push_str("if ");
@@ -2025,7 +2128,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 self.print_ty(&Type::Id(*ty));
                 self.gen.src.push_str("\n");
                 for (i, (case, (block, block_results))) in
-                    variant.cases.iter().zip(blocks).enumerate()
+                variant.cases.iter().zip(blocks).enumerate()
                 {
                     if i == 0 {
                         self.gen.src.push_str("if ");
@@ -2421,7 +2524,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     FunctionKind::Freestanding => {
                         self.gen
                             .src
-                            .push_str(&format!("{}({})", self.callee, operands.join(", "),));
+                            .push_str(&format!("{}({})", self.callee, operands.join(", "), ));
                     }
                     FunctionKind::Method(_)
                     | FunctionKind::Static(_)
@@ -2477,6 +2580,18 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 );
                 uwriteln!(self.gen.src, "assert(isinstance({ptr}, int))");
                 results.push(ptr);
+            }
+            Instruction::HandleLift { handle, name, ty } => {
+                // TODO: I believe this is where you push the handle back up.
+                //  Check out jco's code here.  It's quite involved.
+                let _a = 1;
+                let rsc = "ret".to_string();
+                results.push(rsc);
+            }
+            Instruction::HandleLower { handle, name, .. } => {
+                // TODO: check out jso in src/function_bindgen.rs
+                let handle = "handleLowerInstruction".to_string();
+                results.push(handle);
             }
 
             i => unimplemented!("{:?}", i),
