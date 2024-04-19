@@ -908,7 +908,21 @@ impl<'a> Instantiator<'a> {
         // with a resource vs. functions directly on the interface.  The code is
         // *mostly* the same, except, we want to generate this code in a separate
         // class entirely.
+        // We need to keep a map of resource lifts to list of lifts/functions associated with it
+        let mut resource_lifts: IndexMap<TypeId, Vec<&Lift<'_>>> = IndexMap::new();
+        // At this point, self.gen.init is pointing to the right export!
         for lift in lifts {
+            // If it's a resource lift (constructor, method, or static) then add it to
+            // the resource lifts and skip it for now.
+            if let FunctionKind::Constructor(ty)
+            | FunctionKind::Method(ty)
+            | FunctionKind::Static(ty) = lift.func.kind
+            {
+                // Add it to the resource_lifts map.
+                resource_lifts.entry(ty).or_default().push(lift);
+                continue;
+            }
+
             // Go through some small gymnastics to print the function signature
             // here.
             let mut gen = InterfaceGenerator {
@@ -938,10 +952,52 @@ impl<'a> Instantiator<'a> {
             );
             self.gen.init.dedent();
         }
+        // Now we iterate through the resource lifts and generate the resource class and lifts.
+        for (ty, lifts) in resource_lifts {
+            let cls_name = self.resolve.types[ty]
+                .name
+                .as_ref()
+                .unwrap()
+                .to_upper_camel_case()
+                .escape();
+            self.gen.init.dedent();
+            self.gen.init.push_str(&format!("class _{cls_name}:\n"));
+            self.gen.init.indent();
+            for lift in lifts {
+                // Go through some small gymnastics to print the function signature
+                // here.
+                let mut gen = InterfaceGenerator {
+                    resolve: self.resolve,
+                    src: mem::take(&mut self.gen.init),
+                    gen: self.gen,
+                    interface: lift.interface,
+                    at_root: ns.is_none(),
+                };
+                let params = gen.print_sig(lift.func, false);
+                let src = mem::take(&mut gen.src);
+                self.gen.init = src;
+                self.gen.init.push_str(":\n");
+
+                // Defer to `self.bindgen` for the body of the function.
+                self.gen.init.indent();
+                self.gen.init.docstring(&lift.func.docs);
+                self.bindgen(
+                    params,
+                    format!("{this}.{}", lift.callee),
+                    lift.opts,
+                    lift.func,
+                    AbiVariant::GuestExport,
+                    &this,
+                    lift.interface,
+                    ns.is_none(),
+                );
+                self.gen.init.dedent();
+            }
+            self.gen.init.dedent();
+        }
 
         // Undo the swap done above.
         if let Some(ns) = ns {
-            self.gen.init.dedent();
             mem::swap(&mut self.gen.init, self.gen.exports.get_mut(ns).unwrap());
         }
     }
@@ -1133,7 +1189,7 @@ impl InterfaceGenerator<'_> {
         let func_name = func.item_name().to_snake_case().escape();
         let py_name = match func.kind {
             FunctionKind::Constructor(_) => "__init__",
-            _ => &func_name
+            _ => &func_name,
         };
         self.src.push_str(py_name);
         if in_import {
@@ -1151,8 +1207,8 @@ impl InterfaceGenerator<'_> {
                 let first_param = &func.params[0].0;
                 params.push(first_param.to_snake_case().escape());
                 &func.params[1..]
-            },
-            _ => &func.params
+            }
+            _ => &func.params,
         };
         for (param, ty) in func_params.iter() {
             self.src.push_str(", ");
@@ -1199,14 +1255,7 @@ impl InterfaceGenerator<'_> {
                 TypeDefKind::Type(t) => self.type_alias(id, name, t, &ty.docs),
                 TypeDefKind::Future(_) => todo!("generate for future"),
                 TypeDefKind::Stream(_) => todo!("generate for stream"),
-                TypeDefKind::Resource => {
-                    self.type_resource(id, name, interface)
-                    // This is where we actually define the resource type.  We'd likely generate
-                    // a class MyClass(Protocol): ...
-                    // here.
-                    // This is generated BEFORE the interface type class.
-                    //self.src.push_str("\n===HELLO FROM TypeDefKind::Resource\n===\n");
-                }
+                TypeDefKind::Resource => self.type_resource(id, name, interface),
                 TypeDefKind::Handle(_) => unimplemented!(),
                 TypeDefKind::Unknown => unreachable!(),
             }
@@ -1214,27 +1263,26 @@ impl InterfaceGenerator<'_> {
     }
 
     fn type_resource(&mut self, id: TypeId, name: &str, interface: InterfaceId) {
-        //
         self.src.pyimport("typing", "Protocol");
         let cls_name = name.to_upper_camel_case().escape();
-        let methods = self.resolve.interfaces[interface].functions
+        let methods = self.resolve.interfaces[interface]
+            .functions
             .iter()
-            .filter_map(|(_, func)| {
-                match func.kind {
-                    FunctionKind::Method(t)
-                    | FunctionKind::Static(t)
-                    | FunctionKind::Constructor(t) => {
-                        if t == id {
-                            Some(func)
-                        } else {
-                            None
-                        }
+            .filter_map(|(_, func)| match func.kind {
+                FunctionKind::Method(t)
+                | FunctionKind::Static(t)
+                | FunctionKind::Constructor(t) => {
+                    if t == id {
+                        Some(func)
+                    } else {
+                        None
                     }
-                    _ => None
                 }
+                _ => None,
             })
             .collect::<Vec<_>>();
-        self.src.push_str(&format!("class {}(Protocol):\n", cls_name));
+        self.src
+            .push_str(&format!("class {}(Protocol):\n", cls_name));
         self.src.indent();
         for method in &methods {
             self.print_sig(method, false);
@@ -1879,6 +1927,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
         operands: &mut Vec<String>,
         results: &mut Vec<String>,
     ) {
+        //println!("emit: {:?}", inst);
         match inst {
             Instruction::GetArg { nth } => results.push(self.params[*nth].clone()),
             Instruction::I32Const { val } => results.push(val.to_string()),
