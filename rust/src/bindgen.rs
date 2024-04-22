@@ -35,11 +35,7 @@ use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 use std::mem;
-use wasmtime_environ::component::{
-    CanonicalOptions, Component, ComponentTypesBuilder, CoreDef, CoreExport, Export, ExportItem,
-    GlobalInitializer, InstantiateModule, LoweredIndex, RuntimeImportIndex, RuntimeInstanceIndex,
-    StaticModuleIndex, StringEncoding, Trampoline, TrampolineIndex, Translator, TypeFuncIndex,
-};
+use wasmtime_environ::component::{CanonicalOptions, Component, ComponentTypesBuilder, CoreDef, CoreExport, Export, ExportItem, GlobalInitializer, InstantiateModule, LoweredIndex, RuntimeImportIndex, RuntimeInstanceIndex, StaticModuleIndex, StringEncoding, Trampoline, TrampolineIndex, Translator, TypeFuncIndex, TypeResourceTableIndex};
 use wasmtime_environ::wasmparser::{Validator, WasmFeatures};
 use wasmtime_environ::{EntityIndex, ModuleTranslation, PrimaryMap, ScopeVec, Tunables};
 use wit_bindgen_core::abi::{self, AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType};
@@ -76,6 +72,7 @@ pub struct WasmtimePy {
     exported_interfaces: HashMap<InterfaceId, String>,
 
     lowerings: PrimaryMap<LoweredIndex, (TrampolineIndex, TypeFuncIndex, CanonicalOptions)>,
+    resources: Vec<(TypeResourceTableIndex, TrampolineIndex, Trampoline)>,
 }
 
 impl WasmtimePy {
@@ -182,7 +179,17 @@ impl WasmtimePy {
                 Trampoline::Transcoder { .. } => unimplemented!(),
                 Trampoline::AlwaysTrap => unimplemented!(),
                 Trampoline::ResourceNew(idx) => {
-                    // TODO: Need to figure out how trampoline gets generated here.
+                    // TODO: This code path happens *before the `class Root` part:
+                    //
+                    //
+                    // <-- This is where this code is run.
+                    // class Root:
+                    //     def __init__(self, ...): ...
+                    // We might use it if we decide we want to geneate tables at the module
+                    // scope but it seems like the general pattern is to do this within root.
+                    let t = trampoline.clone();
+                    self.resources.push((*idx, trampoline_index, *t.clone()));
+                    self.init.push_str("#Trampoline::ResourceNew\n");
                     let _rid = idx.as_u32();
                 }
                 Trampoline::ResourceRep(_) => unimplemented!(),
@@ -889,6 +896,9 @@ impl<'a> Instantiator<'a> {
             );
             src.indent();
             uwriteln!(src, "self.component = component");
+            // jmes: Need to add the helper for instantiating resources here.
+            // self.DemoResourceClass = create_demo_resource_class(component)
+            uwriteln!(src, "self.DemoResourceClass = create_demo_resource_class(component)");
             src.dedent();
 
             this.push_str(".component");
@@ -954,13 +964,21 @@ impl<'a> Instantiator<'a> {
         }
         // Now we iterate through the resource lifts and generate the resource class and lifts.
         for (ty, lifts) in resource_lifts {
-            let cls_name = self.resolve.types[ty]
+            let resource_name = self.resolve.types[ty]
                 .name
                 .as_ref()
-                .unwrap()
+                .unwrap();
+            let cls_name = resource_name
                 .to_upper_camel_case()
                 .escape();
+            let create_name = resource_name
+                .to_snake_case()
+                .escape();
             self.gen.init.dedent();
+            self.gen.init.push_str(
+                &format!("\n\ndef create_{}(component: 'Root') -> type[{}]:\n", create_name, cls_name)
+            );
+            self.gen.init.indent();
             self.gen.init.push_str(&format!("class _{cls_name}:\n"));
             self.gen.init.indent();
             for lift in lifts {
@@ -981,6 +999,7 @@ impl<'a> Instantiator<'a> {
                 // Defer to `self.bindgen` for the body of the function.
                 self.gen.init.indent();
                 self.gen.init.docstring(&lift.func.docs);
+                self.gen.init.push_str("self.component = component\n");
                 self.bindgen(
                     params,
                     format!("{this}.{}", lift.callee),
@@ -994,6 +1013,7 @@ impl<'a> Instantiator<'a> {
                 self.gen.init.dedent();
             }
             self.gen.init.dedent();
+            self.gen.init.push_str(&format!("return _{}", cls_name));
         }
 
         // Undo the swap done above.
@@ -1927,7 +1947,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
         operands: &mut Vec<String>,
         results: &mut Vec<String>,
     ) {
-        //println!("emit: {:?}", inst);
+        println!("emit: {:?}", inst);
         match inst {
             Instruction::GetArg { nth } => results.push(self.params[*nth].clone()),
             Instruction::I32Const { val } => results.push(val.to_string()),
@@ -2584,17 +2604,25 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 self.gen.src.push_str("\n");
             }
 
-            Instruction::Return { amt, .. } => {
+            Instruction::Return { amt, func } => {
+                // TODO: jmes you are here.  You need to special case the __init__
+                // of a resource to not return a result and instead work the magic of
+                // adding to the handle table.
                 if let Some(s) = &self.post_return {
                     self.gen.src.push_str(&format!("{s}(caller, ret)\n"));
                 }
-                match amt {
-                    0 => {}
-                    1 => self.gen.src.push_str(&format!("return {}\n", operands[0])),
+                match func.kind {
+                    FunctionKind::Constructor(_) => {} // No return value for __init__
                     _ => {
-                        self.gen
-                            .src
-                            .push_str(&format!("return ({})\n", operands.join(", ")));
+                        match amt {
+                            0 => {}
+                            1 => self.gen.src.push_str(&format!("return {}\n", operands[0])),
+                            _ => {
+                                self.gen
+                                    .src
+                                    .push_str(&format!("return ({})\n", operands.join(", ")));
+                            }
+                        }
                     }
                 }
             }
@@ -2633,13 +2661,16 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             Instruction::HandleLift { handle, name, ty } => {
                 // TODO: I believe this is where you push the handle back up.
                 //  Check out jco's code here.  It's quite involved.
-                let _a = 1;
+                uwriteln!(self.gen.src, "self.component = component");
+                // TODO: remove handle from handle table.
                 let rsc = "ret".to_string();
+                uwriteln!(self.gen.src, "self._rep = ret");
                 results.push(rsc);
             }
             Instruction::HandleLower { handle, name, .. } => {
                 // TODO: check out jso in src/function_bindgen.rs
-                let handle = "handleLowerInstruction".to_string();
+                uwriteln!(self.gen.src, "# Instruction::HandleLower code here");
+                let handle = "self._rep".to_string();
                 results.push(handle);
             }
 
